@@ -1,0 +1,42 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Intermediate outputs (large, reproducible)
+output/segments/
+output/spectrograms/
+output/segments_metadata.csv
+output/spectrograms_metadata.csv
+output/master_labels.csv
+output/training_history.csv
+
+# Training data (too large for git)
+training-a/
+training-b/
+training-c/
+training-d/
+training-e/
+training-f/
+validation/
+
+# Certs (local only)
+certs/
+
+# Gradio cache
+.gradio/
+
+# Pytest cache
+.pytest_cache/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+*.swp

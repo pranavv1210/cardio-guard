@@ -1,0 +1,15 @@
+numpy>=2.0
+scipy>=1.14
+PyWavelets>=1.6
+librosa>=0.10
+soundfile>=0.12
+pandas>=2.0
+scikit-learn>=1.4
+matplotlib>=3.8
+seaborn>=0.13
+torch>=2.2 --index-url https://download.pytorch.org/whl/cpu
+torchvision>=0.17 --index-url https://download.pytorch.org/whl/cpu
+torchaudio>=2.2 --index-url https://download.pytorch.org/whl/cpu
+timm>=1.0
+gradio>=6.0
+Pillow>=10.0
