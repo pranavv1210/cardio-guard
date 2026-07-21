@@ -1,0 +1,26 @@
+{
+  "accuracy": 0.9212962962962963,
+  "normal_recall_specificity": 0.9631067961165048,
+  "abnormal_recall_sensitivity": 0.7593984962406015,
+  "abnormal_precision": 0.8416666666666667,
+  "abnormal_f1": 0.7984189723320159,
+  "confusion_matrix_labels": [
+    "NORMAL",
+    "ABNORMAL"
+  ],
+  "confusion_matrix": [
+    [
+      496,
+      19
+    ],
+    [
+      32,
+      101
+    ]
+  ],
+  "mean_abnormal_probability": 0.22048794549965753,
+  "dataset": "public PhysioNet/CinC 2016 training archive",
+  "split": "80/20 stratified train/holdout",
+  "train_recordings": 2592,
+  "holdout_recordings": 648
+}

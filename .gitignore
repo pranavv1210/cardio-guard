@@ -14,8 +14,12 @@ output/segments_metadata.csv
 output/spectrograms_metadata.csv
 output/master_labels.csv
 output/training_history.csv
+output/results/public_training_*.csv
+output/results/public_training_metrics.json
+output/results/public_training_predictions*.csv
 
 # Training data (too large for git)
+data/
 training-a/
 training-b/
 training-c/

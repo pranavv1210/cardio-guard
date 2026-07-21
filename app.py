@@ -19,11 +19,11 @@ import matplotlib
 import numpy as np
 import torch
 from PIL import Image
-from scipy.signal import welch
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from src.acoustic_features import band_energy_ratio, extract_acoustic_features
 from src.config import (
     SAMPLE_RATE,
     SEGMENT_SAMPLES,
@@ -40,9 +40,11 @@ logger = logging.getLogger(__name__)
 _model = None
 _device = None
 _transform = None
+_acoustic_model = None
 
 _NATIVE_EXTS = {".wav", ".flac", ".ogg", ".mp3"}
 LOW_MODEL_CONFIDENCE = 0.60
+ACOUSTIC_MODEL_PATH = PROJECT_ROOT / "models" / "acoustic_model.joblib"
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,16 @@ def get_model():
         logger.info("Model loaded from %s on %s", model_path, _device)
 
     return _model, _device, _transform
+
+
+def get_acoustic_model():
+    """Load optional trained acoustic fallback model."""
+    global _acoustic_model
+    if _acoustic_model is None and ACOUSTIC_MODEL_PATH.exists():
+        import joblib
+
+        _acoustic_model = joblib.load(ACOUSTIC_MODEL_PATH)
+    return _acoustic_model
 
 
 def _ensure_wav(filepath: str) -> str:
@@ -196,24 +208,12 @@ def _predict_probabilities(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.mean(probs, axis=0), display_mel
 
 
-def _band_energy_ratio(frequencies: np.ndarray, power: np.ndarray, low: float, high: float) -> float:
-    mask = (frequencies >= low) & (frequencies < high)
-    total_mask = (frequencies >= 20) & (frequencies <= 500)
-    total = np.trapezoid(power[total_mask], frequencies[total_mask])
-    if total <= 1e-12:
-        return 0.0
-    return float(np.trapezoid(power[mask], frequencies[mask]) / total)
+def _rule_based_murmur_probabilities(audio: np.ndarray) -> np.ndarray:
+    from scipy.signal import welch
 
-
-def _acoustic_murmur_probabilities(audio: np.ndarray) -> np.ndarray:
-    """Estimate abnormal probability from murmur-like acoustic features.
-
-    This is used only when the CNN is low-confidence. It catches broadband or
-    mid-frequency murmur energy that the placeholder checkpoint can miss.
-    """
     frequencies, power = welch(audio, fs=SAMPLE_RATE, nperseg=min(1024, len(audio)))
-    murmur_band = _band_energy_ratio(frequencies, power, 140, 220)
-    high_band = _band_energy_ratio(frequencies, power, 220, 400)
+    murmur_band = band_energy_ratio(frequencies, power, 140, 220)
+    high_band = band_energy_ratio(frequencies, power, 220, 400)
     zcr = float(np.mean(librosa.feature.zero_crossing_rate(audio, frame_length=512, hop_length=128)))
     flatness = float(np.mean(librosa.feature.spectral_flatness(y=audio, n_fft=512, hop_length=128)))
 
@@ -224,6 +224,19 @@ def _acoustic_murmur_probabilities(audio: np.ndarray) -> np.ndarray:
     score += np.clip((high_band - 0.0008) / 0.0030, 0.0, 1.0) * 0.10
 
     abnormal_probability = float(np.clip(0.10 + (0.85 * score), 0.05, 0.95))
+    return np.array([1.0 - abnormal_probability, abnormal_probability], dtype=np.float32)
+
+
+def _acoustic_murmur_probabilities(audio: np.ndarray) -> np.ndarray:
+    """Estimate abnormal probability from trained acoustic and murmur features."""
+    rule_probabilities = _rule_based_murmur_probabilities(audio)
+    acoustic_model = get_acoustic_model()
+    if acoustic_model is None:
+        return rule_probabilities
+
+    features = extract_acoustic_features(audio, SAMPLE_RATE).reshape(1, -1)
+    model_probabilities = acoustic_model.predict_proba(features)[0]
+    abnormal_probability = max(float(model_probabilities[1]), float(rule_probabilities[1]))
     return np.array([1.0 - abnormal_probability, abnormal_probability], dtype=np.float32)
 
 
@@ -415,7 +428,7 @@ def render_streamlit_app() -> None:
         if audio_input is None:
             st.info("Recording requires a newer Streamlit version. Upload audio instead.")
         else:
-            recording = audio_input("Record heart sound", label_visibility="collapsed")
+            recording = audio_input("Record heart sound, stop after a few seconds, then analyze")
             if recording is not None:
                 st.audio(recording)
                 audio_path = _write_uploaded_audio(recording)
