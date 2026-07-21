@@ -17,6 +17,18 @@ Class mapping is fixed:
 | `0` | Normal |
 | `1` | Abnormal |
 
+## Accuracy And Validation
+
+Current repository validation:
+
+| Validation set | Accuracy |
+| --- | --- |
+| Bundled smoke-test samples (`samples/normal_heart_sound.wav`, `samples/abnormal_heart_sound.wav`) | 100% (2/2) |
+
+The repository does not currently include the full held-out PhysioNet test split, prediction CSV, confusion matrix, or metrics artifact needed to recompute a whole-project test accuracy from source. Because of that, the only accuracy that can be verified directly from this checkout is the bundled sample sanity check above.
+
+Important implementation detail: the included CNN checkpoint is low-confidence on the bundled samples, so the app uses an acoustic murmur fallback when the CNN confidence is below 60%. This prevents the app from blindly returning `NORMAL` for murmur-like abnormal recordings when the checkpoint is near 50/50.
+
 ## Run Locally
 
 ```powershell
@@ -62,6 +74,8 @@ The app tests include explicit guards for the most important behavior:
 
 - low abnormal probability predicts `NORMAL`
 - high abnormal probability predicts `ABNORMAL`
+- bundled normal sample predicts `NORMAL`
+- bundled abnormal sample predicts `ABNORMAL`
 - short or missing audio returns a clear error
 
 ## Disclaimer

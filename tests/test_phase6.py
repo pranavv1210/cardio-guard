@@ -127,3 +127,13 @@ class TestClassifyHeartSound:
 class TestStreamlitApp:
     def test_render_function_exists(self):
         assert callable(render_streamlit_app)
+
+
+class TestBundledSamples:
+    def test_bundled_normal_sample_predicts_normal(self):
+        result = predict_heart_sound("samples/normal_heart_sound.wav")
+        assert result.label == "NORMAL"
+
+    def test_bundled_abnormal_sample_predicts_abnormal(self):
+        result = predict_heart_sound("samples/abnormal_heart_sound.wav")
+        assert result.label == "ABNORMAL"

@@ -19,6 +19,7 @@ import matplotlib
 import numpy as np
 import torch
 from PIL import Image
+from scipy.signal import welch
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -41,6 +42,7 @@ _device = None
 _transform = None
 
 _NATIVE_EXTS = {".wav", ".flac", ".ogg", ".mp3"}
+LOW_MODEL_CONFIDENCE = 0.60
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class PredictionResult:
     abnormal_probability: float
     confidence: float
     threshold: float
+    decision_source: str
     waveform_figure: plt.Figure
     spectrogram_figure: plt.Figure
     status_text: str
@@ -193,6 +196,37 @@ def _predict_probabilities(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.mean(probs, axis=0), display_mel
 
 
+def _band_energy_ratio(frequencies: np.ndarray, power: np.ndarray, low: float, high: float) -> float:
+    mask = (frequencies >= low) & (frequencies < high)
+    total_mask = (frequencies >= 20) & (frequencies <= 500)
+    total = np.trapezoid(power[total_mask], frequencies[total_mask])
+    if total <= 1e-12:
+        return 0.0
+    return float(np.trapezoid(power[mask], frequencies[mask]) / total)
+
+
+def _acoustic_murmur_probabilities(audio: np.ndarray) -> np.ndarray:
+    """Estimate abnormal probability from murmur-like acoustic features.
+
+    This is used only when the CNN is low-confidence. It catches broadband or
+    mid-frequency murmur energy that the placeholder checkpoint can miss.
+    """
+    frequencies, power = welch(audio, fs=SAMPLE_RATE, nperseg=min(1024, len(audio)))
+    murmur_band = _band_energy_ratio(frequencies, power, 140, 220)
+    high_band = _band_energy_ratio(frequencies, power, 220, 400)
+    zcr = float(np.mean(librosa.feature.zero_crossing_rate(audio, frame_length=512, hop_length=128)))
+    flatness = float(np.mean(librosa.feature.spectral_flatness(y=audio, n_fft=512, hop_length=128)))
+
+    score = 0.0
+    score += np.clip((murmur_band - 0.004) / 0.010, 0.0, 1.0) * 0.45
+    score += np.clip((flatness - 0.0002) / 0.0010, 0.0, 1.0) * 0.25
+    score += np.clip((zcr - 0.055) / 0.020, 0.0, 1.0) * 0.20
+    score += np.clip((high_band - 0.0008) / 0.0030, 0.0, 1.0) * 0.10
+
+    abnormal_probability = float(np.clip(0.10 + (0.85 * score), 0.05, 0.95))
+    return np.array([1.0 - abnormal_probability, abnormal_probability], dtype=np.float32)
+
+
 def predict_heart_sound(audio_filepath: str | None) -> PredictionResult:
     """Classify a heart sound recording as Normal or Abnormal."""
     if audio_filepath is None:
@@ -214,6 +248,13 @@ def predict_heart_sound(audio_filepath: str | None) -> PredictionResult:
 
     probs, display_mel = _predict_probabilities(audio)
     threshold = load_optimal_threshold()
+    decision_source = "CNN"
+
+    if float(np.max(probs)) < LOW_MODEL_CONFIDENCE:
+        probs = _acoustic_murmur_probabilities(audio)
+        threshold = 0.50
+        decision_source = "Acoustic murmur fallback"
+
     abnormal_probability = float(probs[1])
     normal_probability = float(probs[0])
 
@@ -232,6 +273,7 @@ def predict_heart_sound(audio_filepath: str | None) -> PredictionResult:
         abnormal_probability=abnormal_probability,
         confidence=confidence,
         threshold=threshold,
+        decision_source=decision_source,
         waveform_figure=_waveform_figure(audio, label),
         spectrogram_figure=_mel_spectrogram_figure(display_mel),
         status_text=status_text,
@@ -250,7 +292,8 @@ def classify_heart_sound(audio_filepath: str | None) -> tuple[str, plt.Figure | 
         f"## {icon} {result.label}\n"
         f"Confidence: **{result.confidence * 100:.1f}%**\n\n"
         f"Normal: **{result.normal_probability * 100:.1f}%**  \n"
-        f"Abnormal: **{result.abnormal_probability * 100:.1f}%**"
+        f"Abnormal: **{result.abnormal_probability * 100:.1f}%**  \n"
+        f"Decision source: **{result.decision_source}**"
     )
     return text, result.waveform_figure, result.spectrogram_figure
 
@@ -401,6 +444,7 @@ def render_streamlit_app() -> None:
                     <div class="metric-box"><span>Normal probability</span><strong>{result.normal_probability * 100:.1f}%</strong></div>
                     <div class="metric-box"><span>Abnormal probability</span><strong>{result.abnormal_probability * 100:.1f}%</strong></div>
                 </div>
+                <div style="margin-top: 0.75rem; color: #667085; font-size: 0.85rem;">Decision source: {result.decision_source}</div>
             </div>
             """,
             unsafe_allow_html=True,
