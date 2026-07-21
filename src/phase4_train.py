@@ -12,7 +12,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torchvision import transforms
 import timm
 from PIL import Image
 
@@ -33,6 +32,54 @@ def set_seed(seed: int = RANDOM_SEED):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+class Compose:
+    """Minimal transform composition to avoid a hard torchvision dependency."""
+
+    def __init__(self, transforms: list):
+        self.transforms = transforms
+
+    def __call__(self, img):
+        for transform in self.transforms:
+            img = transform(img)
+        return img
+
+
+class Resize:
+    def __init__(self, size: tuple[int, int]):
+        self.height, self.width = size
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        return img.resize((self.width, self.height), Image.BILINEAR)
+
+
+class RandomHorizontalFlip:
+    def __init__(self, p: float = 0.5):
+        self.p = p
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() < self.p:
+            return img.transpose(Image.FLIP_LEFT_RIGHT)
+        return img
+
+
+class ToTensor:
+    def __call__(self, img: Image.Image) -> torch.Tensor:
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        if arr.ndim == 2:
+            arr = np.expand_dims(arr, axis=-1)
+        arr = np.transpose(arr, (2, 0, 1))
+        return torch.from_numpy(arr.copy())
+
+
+class Normalize:
+    def __init__(self, mean: list[float], std: list[float]):
+        self.mean = torch.tensor(mean, dtype=torch.float32).view(-1, 1, 1)
+        self.std = torch.tensor(std, dtype=torch.float32).view(-1, 1, 1)
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        return (tensor - self.mean) / self.std
 
 
 class SpecAugment:
@@ -87,7 +134,7 @@ class SpectrogramDataset(Dataset):
         return img, label
 
 
-def get_transforms(is_train: bool = True) -> transforms.Compose:
+def get_transforms(is_train: bool = True) -> Compose:
     """Get image transforms for training or evaluation.
 
     Args:
@@ -97,20 +144,20 @@ def get_transforms(is_train: bool = True) -> transforms.Compose:
         torchvision Compose transform.
     """
     if is_train:
-        return transforms.Compose([
-            transforms.Resize((SPEC_HEIGHT, SPEC_WIDTH)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
+        return Compose([
+            Resize((SPEC_HEIGHT, SPEC_WIDTH)),
+            RandomHorizontalFlip(p=0.5),
+            ToTensor(),
+            Normalize(mean=[0.485, 0.456, 0.406],
+                      std=[0.229, 0.224, 0.225]),
             SpecAugment(),
         ])
     else:
-        return transforms.Compose([
-            transforms.Resize((SPEC_HEIGHT, SPEC_WIDTH)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
+        return Compose([
+            Resize((SPEC_HEIGHT, SPEC_WIDTH)),
+            ToTensor(),
+            Normalize(mean=[0.485, 0.456, 0.406],
+                      std=[0.229, 0.224, 0.225]),
         ])
 
 

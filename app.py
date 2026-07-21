@@ -1,62 +1,74 @@
 """
-Phase 6 — Gradio Web App for Heart Sound Classification
-Upload a .wav file → preprocessing → mel spectrogram → CNN inference → result.
+Streamlit mobile app for heart sound classification.
+
+Inference contract:
+- class index 0 = Normal
+- class index 1 = Abnormal
+- decision uses abnormal probability >= saved optimal threshold
 """
+from __future__ import annotations
+
 import logging
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
+import librosa
+import matplotlib
 import numpy as np
 import torch
-import librosa
-import gradio as gr
-import matplotlib
+from PIL import Image
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from src.config import (
-    SAMPLE_RATE, N_MELS, N_FFT, HOP_LENGTH,
-    SPEC_HEIGHT, SPEC_WIDTH,
-    SEGMENT_SAMPLES, MODELS_DIR, LABEL_NAMES, PROJECT_ROOT,
+    SAMPLE_RATE,
+    SEGMENT_SAMPLES,
+    MODELS_DIR,
+    PROJECT_ROOT,
 )
 from src.phase2_preprocess import preprocess_audio
 from src.phase3_spectrograms import compute_mel_spectrogram, spectrogram_to_image
 from src.phase4_train import build_model, get_transforms
 from src.phase5_evaluate import load_optimal_threshold
-from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-APP_CSS = """
-.main-title { text-align: center; margin-bottom: 0.5em; }
-.subtitle { text-align: center; color: #aaa; margin-bottom: 1.5em; font-size: 0.95em; }
-.result-box { min-height: 120px; display: flex; align-items: center; justify-content: center;
-              border: 2px solid #333; border-radius: 12px; padding: 20px; }
-.disclaimer { text-align: center; font-size: 0.8em; color: #888; margin-top: 0; }
-.how-it-works { font-size: 0.9em; color: #aaa; }
-"""
-
-# ─── Global model (loaded once) ──────────────────────────────────────────────
 _model = None
 _device = None
 _transform = None
 
+_NATIVE_EXTS = {".wav", ".flac", ".ogg", ".mp3"}
+MIN_BINARY_CONFIDENCE = 0.60
+
+
+@dataclass(frozen=True)
+class PredictionResult:
+    label: str
+    normal_probability: float
+    abnormal_probability: float
+    confidence: float
+    threshold: float
+    waveform_figure: plt.Figure
+    spectrogram_figure: plt.Figure
+    status_text: str
+
 
 def get_model():
-    """Load model lazily on first call."""
+    """Load the trained model lazily once per process."""
     global _model, _device, _transform
 
     if _model is None:
         _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # Primary: output/models/ (local training); Fallback: models/ (deployment)
         model_path = MODELS_DIR / "best_model.pt"
         if not model_path.exists():
             model_path = PROJECT_ROOT / "models" / "best_model.pt"
 
         if not model_path.exists():
             raise FileNotFoundError(
-                f"No trained model found. Expected {MODELS_DIR / 'best_model.pt'} or "
+                f"No trained model found at {MODELS_DIR / 'best_model.pt'} or "
                 f"{PROJECT_ROOT / 'models' / 'best_model.pt'}."
             )
 
@@ -66,65 +78,13 @@ def get_model():
         _model = _model.to(_device)
         _model.eval()
         _transform = get_transforms(is_train=False)
-
-        logger.info("Model loaded on %s", _device)
+        logger.info("Model loaded from %s on %s", model_path, _device)
 
     return _model, _device, _transform
 
 
-def _mel_spectrogram_figure(mel_db: np.ndarray) -> plt.Figure:
-    """Create a matplotlib figure of the mel spectrogram for display."""
-    fig, ax = plt.subplots(figsize=(7, 3))
-    im = ax.imshow(
-        mel_db, aspect="auto", origin="lower",
-        cmap="magma", interpolation="nearest",
-    )
-    ax.set_xlabel("Time", fontsize=10)
-    ax.set_ylabel("Mel Band", fontsize=10)
-    ax.set_title("Mel Spectrogram", fontsize=12)
-    fig.colorbar(im, ax=ax, label="dB")
-    plt.tight_layout()
-    return fig
-
-
-def _waveform_figure(audio: np.ndarray, label: str) -> plt.Figure:
-    """Create an ECG-style waveform plot of the audio signal."""
-    # Downsample for display (max 3000 points)
-    display_audio = audio
-    if len(audio) > 3000:
-        step = len(audio) // 3000
-        display_audio = audio[::step]
-
-    t = np.linspace(0, len(audio) / SAMPLE_RATE, len(display_audio))
-
-    color = "#e74c3c" if label == "ABNORMAL" else "#2ecc71"
-
-    fig, ax = plt.subplots(figsize=(7, 3), facecolor="#0d0d0d")
-    ax.set_facecolor("#0d0d0d")
-    ax.plot(t, display_audio, color=color, linewidth=0.8, alpha=0.9)
-    ax.set_xlabel("Time (s)", fontsize=10, color="white")
-    ax.set_ylabel("Amplitude", fontsize=10, color="white")
-    ax.set_title("Heart Sound Waveform", fontsize=12, color="white")
-    ax.tick_params(colors="white")
-    ax.spines["bottom"].set_color("#333")
-    ax.spines["left"].set_color("#333")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.grid(True, color="#222", linewidth=0.5, linestyle="--")
-    plt.tight_layout()
-    return fig
-
-
-# Formats librosa/soundfile can read natively (no ffmpeg needed)
-_NATIVE_EXTS = {".wav", ".flac", ".ogg", ".mp3"}
-
-
 def _ensure_wav(filepath: str) -> str:
-    """Convert non-WAV audio to WAV using ffmpeg for reliable loading.
-
-    Gradio mic recordings are already WAV. Uploaded files may be AMR, OPUS,
-    OGG, M4A, etc. — convert them so librosa always gets a WAV.
-    """
+    """Convert uncommon audio formats to WAV when ffmpeg is available."""
     ext = Path(filepath).suffix.lower()
     if ext in _NATIVE_EXTS:
         return filepath
@@ -132,196 +92,335 @@ def _ensure_wav(filepath: str) -> str:
     wav_path = tempfile.mktemp(suffix=".wav")
     try:
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", filepath, "-ar", str(SAMPLE_RATE),
-             "-ac", "1", "-f", "wav", wav_path],
-            capture_output=True, text=True, timeout=30,
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                filepath,
+                "-ar",
+                str(SAMPLE_RATE),
+                "-ac",
+                "1",
+                "-f",
+                "wav",
+                wav_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if result.returncode == 0 and Path(wav_path).exists():
-            logger.info("Converted %s → WAV", ext)
             return wav_path
-    except FileNotFoundError:
-        logger.warning("ffmpeg not found — falling back to direct librosa load")
-    except subprocess.TimeoutExpired:
-        logger.warning("ffmpeg conversion timed out")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        logger.warning("ffmpeg conversion unavailable; trying direct audio load")
 
-    return filepath  # fall back to original path (librosa may still handle it)
+    return filepath
 
 
-def classify_heart_sound(audio_filepath: str) -> tuple:
-    """Classify a heart sound recording as Normal or Abnormal.
+def _mel_spectrogram_figure(mel_db: np.ndarray) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(6, 3))
+    im = ax.imshow(
+        mel_db,
+        aspect="auto",
+        origin="lower",
+        cmap="magma",
+        interpolation="nearest",
+    )
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Mel band")
+    ax.set_title("Mel spectrogram")
+    fig.colorbar(im, ax=ax, label="dB")
+    plt.tight_layout()
+    return fig
 
-    Args:
-        audio_filepath: Path to a .wav file (from Gradio upload).
 
-    Returns:
-        Tuple of (result_text, waveform_figure, spectrogram_figure).
-    """
-    if audio_filepath is None:
-        return "Please upload a heart sound recording.", None, None
+def _waveform_figure(audio: np.ndarray, label: str) -> plt.Figure:
+    display_audio = audio
+    if len(audio) > 3000:
+        step = max(1, len(audio) // 3000)
+        display_audio = audio[::step]
 
-    # Convert any format to WAV via ffmpeg for reliable loading
-    audio_filepath = _ensure_wav(audio_filepath)
+    t = np.linspace(0, len(audio) / SAMPLE_RATE, len(display_audio))
+    color = "#d83b3b" if label == "ABNORMAL" else "#1f9d55"
 
-    try:
-        audio, sr = librosa.load(audio_filepath, sr=SAMPLE_RATE, mono=True)
-        audio = audio.astype(np.float32)
-    except Exception as e:
-        logger.error("Failed to load audio: %s", e)
-        return f"Error: Could not read audio file. ({e})", None, None
+    fig, ax = plt.subplots(figsize=(6, 3), facecolor="#ffffff")
+    ax.plot(t, display_audio, color=color, linewidth=0.9)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude")
+    ax.set_title("Heart sound waveform")
+    ax.grid(True, color="#e7e7e7", linewidth=0.6)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    return fig
 
-    if len(audio) < SAMPLE_RATE:
-        return "Error: Audio too short (need at least 1 second).", None, None
 
-    # Preprocess
-    audio = preprocess_audio(audio, sr=SAMPLE_RATE)
-
-    # Take central 3-second segment (or pad if shorter)
+def _make_segment(audio: np.ndarray) -> np.ndarray:
     if len(audio) >= SEGMENT_SAMPLES:
         center = len(audio) // 2
-        start = center - SEGMENT_SAMPLES // 2
-        segment = audio[start : start + SEGMENT_SAMPLES]
-    else:
-        segment = np.zeros(SEGMENT_SAMPLES, dtype=np.float32)
-        segment[: len(audio)] = audio
+        start = max(0, center - SEGMENT_SAMPLES // 2)
+        return audio[start : start + SEGMENT_SAMPLES]
 
-    # Compute mel spectrogram
+    segment = np.zeros(SEGMENT_SAMPLES, dtype=np.float32)
+    segment[: len(audio)] = audio
+    return segment
+
+
+def _predict_segment(segment: np.ndarray) -> np.ndarray:
     mel_db = compute_mel_spectrogram(segment)
     img = spectrogram_to_image(mel_db)
-
-    # Build spectrogram figure for display
-    spec_fig = _mel_spectrogram_figure(mel_db)
-
-    # Convert to PIL, apply transforms
     model, device, transform = get_model()
     pil_img = Image.fromarray(img).convert("RGB")
     tensor = transform(pil_img).unsqueeze(0).to(device)
 
-    # Inference
     with torch.no_grad():
         output = model(tensor)
-        probs = torch.softmax(output, dim=1).cpu().numpy()[0]
+        return torch.softmax(output, dim=1).cpu().numpy()[0]
 
-    # If recording is long, also do majority voting over multiple segments
-    if len(audio) >= SEGMENT_SAMPLES * 2:
-        all_probs = []
-        hop = SEGMENT_SAMPLES // 2  # 50% overlap
-        for start_idx in range(0, len(audio) - SEGMENT_SAMPLES + 1, hop):
-            seg = audio[start_idx : start_idx + SEGMENT_SAMPLES]
-            mel = compute_mel_spectrogram(seg)
-            im = spectrogram_to_image(mel)
-            pil = Image.fromarray(im).convert("RGB")
-            t = transform(pil).unsqueeze(0).to(device)
-            with torch.no_grad():
-                out = model(t)
-                p = torch.softmax(out, dim=1).cpu().numpy()[0]
-            all_probs.append(p)
 
-        probs = np.mean(all_probs, axis=0)
+def _predict_probabilities(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return averaged class probabilities and the display spectrogram."""
+    center_segment = _make_segment(audio)
+    display_mel = compute_mel_spectrogram(center_segment)
 
-    # Apply optimized threshold (tuned on validation set via Youden's J)
+    if len(audio) < SEGMENT_SAMPLES * 2:
+        return _predict_segment(center_segment), display_mel
+
+    probs = []
+    hop = SEGMENT_SAMPLES // 2
+    for start_idx in range(0, len(audio) - SEGMENT_SAMPLES + 1, hop):
+        probs.append(_predict_segment(audio[start_idx : start_idx + SEGMENT_SAMPLES]))
+
+    return np.mean(probs, axis=0), display_mel
+
+
+def predict_heart_sound(audio_filepath: str | None) -> PredictionResult:
+    """Classify a heart sound recording as Normal or Abnormal."""
+    if audio_filepath is None:
+        raise ValueError("Please upload or record a heart sound recording.")
+
+    audio_filepath = _ensure_wav(audio_filepath)
+    try:
+        audio, _ = librosa.load(audio_filepath, sr=SAMPLE_RATE, mono=True)
+        audio = audio.astype(np.float32)
+    except Exception as exc:
+        raise ValueError(f"Could not read audio file: {exc}") from exc
+
+    if len(audio) < SAMPLE_RATE:
+        raise ValueError("Audio is too short. Please provide at least 1 second.")
+
+    audio = preprocess_audio(audio, sr=SAMPLE_RATE)
+    if len(audio) < SAMPLE_RATE:
+        raise ValueError("Usable heart sound is too short after noise/silence removal.")
+
+    probs, display_mel = _predict_probabilities(audio)
     threshold = load_optimal_threshold()
-    abnormal_prob = float(probs[1])
-    normal_prob = 1.0 - abnormal_prob
-    confidence = max(abnormal_prob, normal_prob) * 100
+    abnormal_probability = float(probs[1])
+    normal_probability = float(probs[0])
 
-    if abnormal_prob >= threshold:
-        label = "ABNORMAL"
-        result_text = f"## \u2757 {label}\nConfidence: **{confidence:.1f}%**"
-    else:
-        label = "NORMAL"
-        result_text = f"## \u2705 {label}\nConfidence: **{confidence:.1f}%**"
+    binary_label = "ABNORMAL" if abnormal_probability >= threshold else "NORMAL"
+    confidence = abnormal_probability if binary_label == "ABNORMAL" else normal_probability
+    label = binary_label if confidence >= MIN_BINARY_CONFIDENCE else "UNCERTAIN"
+    status_text = (
+        f"{label} | confidence {confidence * 100:.1f}% | "
+        f"normal {normal_probability * 100:.1f}% | "
+        f"abnormal {abnormal_probability * 100:.1f}% | "
+        f"threshold {threshold:.3f}"
+    )
 
-    wave_fig = _waveform_figure(audio, label)
+    return PredictionResult(
+        label=label,
+        normal_probability=normal_probability,
+        abnormal_probability=abnormal_probability,
+        confidence=confidence,
+        threshold=threshold,
+        waveform_figure=_waveform_figure(audio, label),
+        spectrogram_figure=_mel_spectrogram_figure(display_mel),
+        status_text=status_text,
+    )
 
-    return result_text, wave_fig, spec_fig
+
+def classify_heart_sound(audio_filepath: str | None) -> tuple[str, plt.Figure | None, plt.Figure | None]:
+    """Backward-compatible wrapper used by tests and simple scripts."""
+    try:
+        result = predict_heart_sound(audio_filepath)
+    except ValueError as exc:
+        return f"Error: {exc}", None, None
+
+    icon = "!" if result.label == "ABNORMAL" else "OK" if result.label == "NORMAL" else "?"
+    text = (
+        f"## {icon} {result.label}\n"
+        f"Confidence: **{result.confidence * 100:.1f}%**\n\n"
+        f"Normal: **{result.normal_probability * 100:.1f}%**  \n"
+        f"Abnormal: **{result.abnormal_probability * 100:.1f}%**"
+    )
+    return text, result.waveform_figure, result.spectrogram_figure
 
 
-def create_app() -> gr.Blocks:
-    """Create the Gradio web application.
+def _write_uploaded_audio(uploaded_file) -> str:
+    suffix = Path(uploaded_file.name).suffix or ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(uploaded_file.getbuffer())
+        return tmp.name
 
-    Returns:
-        Gradio Blocks app ready to launch.
-    """
-    with gr.Blocks(
-        title="Heart Sound Classifier",
-    ) as app:
-        gr.Markdown(
-            "# \U0001FA7A Heart Sound Classifier",
-            elem_classes=["main-title"],
+
+def render_streamlit_app() -> None:
+    import streamlit as st
+
+    st.set_page_config(
+        page_title="CardioGuard",
+        page_icon="heart",
+        layout="centered",
+        initial_sidebar_state="collapsed",
+    )
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            max-width: 680px;
+            padding: 1rem 0.85rem 2rem;
+        }
+        h1 {
+            font-size: 1.85rem !important;
+            line-height: 1.15 !important;
+            margin-bottom: 0.2rem !important;
+        }
+        .cg-subtitle {
+            color: #5f6368;
+            font-size: 0.95rem;
+            margin-bottom: 1rem;
+        }
+        .result-card {
+            border: 1px solid #e4e7ec;
+            border-radius: 8px;
+            padding: 1rem;
+            margin: 1rem 0;
+            background: #ffffff;
+            box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+        }
+        .result-normal {
+            border-left: 6px solid #1f9d55;
+        }
+        .result-abnormal {
+            border-left: 6px solid #d83b3b;
+        }
+        .result-uncertain {
+            border-left: 6px solid #b7791f;
+        }
+        .result-label {
+            font-size: 1.55rem;
+            font-weight: 800;
+            margin-bottom: 0.35rem;
+        }
+        .metric-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.65rem;
+            margin-top: 0.85rem;
+        }
+        .metric-box {
+            border: 1px solid #edf0f3;
+            border-radius: 8px;
+            padding: 0.75rem;
+            background: #fafafa;
+        }
+        .metric-box span {
+            display: block;
+            color: #667085;
+            font-size: 0.78rem;
+        }
+        .metric-box strong {
+            display: block;
+            font-size: 1.2rem;
+            margin-top: 0.15rem;
+        }
+        .disclaimer {
+            color: #667085;
+            font-size: 0.82rem;
+            line-height: 1.35;
+            margin-top: 1rem;
+        }
+        @media (max-width: 480px) {
+            .metric-row { grid-template-columns: 1fr; }
+            h1 { font-size: 1.6rem !important; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.title("CardioGuard")
+    st.markdown(
+        "<div class='cg-subtitle'>Mobile-first heart sound screening for Normal vs Abnormal recordings.</div>",
+        unsafe_allow_html=True,
+    )
+
+    tab_upload, tab_record = st.tabs(["Upload", "Record"])
+    audio_path = None
+
+    with tab_upload:
+        uploaded_file = st.file_uploader(
+            "Heart sound audio",
+            type=["wav", "flac", "ogg", "mp3", "m4a", "opus", "amr"],
+            label_visibility="collapsed",
         )
-        gr.Markdown(
-            "AI-powered heart sound analysis using EfficientNet-B0 trained on PhysioNet 2016",
-            elem_classes=["subtitle"],
+        if uploaded_file is not None:
+            st.audio(uploaded_file)
+            audio_path = _write_uploaded_audio(uploaded_file)
+
+    with tab_record:
+        audio_input = getattr(st, "audio_input", None) or getattr(st, "experimental_audio_input", None)
+        if audio_input is None:
+            st.info("Recording requires a newer Streamlit version. Upload audio instead.")
+        else:
+            recording = audio_input("Record heart sound", label_visibility="collapsed")
+            if recording is not None:
+                st.audio(recording)
+                audio_path = _write_uploaded_audio(recording)
+
+    analyze = st.button("Analyze", type="primary", use_container_width=True)
+
+    if analyze:
+        if audio_path is None:
+            st.error("Upload or record at least 1 second of heart sound audio.")
+            return
+
+        with st.spinner("Analyzing heart sound..."):
+            try:
+                result = predict_heart_sound(audio_path)
+            except Exception as exc:
+                st.error(str(exc))
+                return
+
+        if result.label == "ABNORMAL":
+            result_class = "result-abnormal"
+        elif result.label == "NORMAL":
+            result_class = "result-normal"
+        else:
+            result_class = "result-uncertain"
+        st.markdown(
+            f"""
+            <div class="result-card {result_class}">
+                <div class="result-label">{result.label}</div>
+                <div>Confidence: <strong>{result.confidence * 100:.1f}%</strong></div>
+                <div class="metric-row">
+                    <div class="metric-box"><span>Normal probability</span><strong>{result.normal_probability * 100:.1f}%</strong></div>
+                    <div class="metric-box"><span>Abnormal probability</span><strong>{result.abnormal_probability * 100:.1f}%</strong></div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-        with gr.Row(equal_height=True):
-            with gr.Column(scale=2):
-                audio_input = gr.Audio(
-                    label="\U0001F3B5 Upload or Record Heart Sound",
-                    type="filepath",
-                    sources=["upload", "microphone"],
-                )
-                analyze_btn = gr.Button(
-                    "\U0001F50D Analyze",
-                    variant="primary",
-                    size="lg",
-                )
-            with gr.Column(scale=1):
-                output_result = gr.Markdown(
-                    value="Upload a .wav file and click **Analyze**",
-                    elem_classes=["result-box"],
-                )
+        st.pyplot(result.waveform_figure, clear_figure=True, use_container_width=True)
+        st.pyplot(result.spectrogram_figure, clear_figure=True, use_container_width=True)
 
-        gr.Markdown("---")
-
-        with gr.Row(equal_height=True):
-            with gr.Column():
-                wave_plot = gr.Plot(label="\U0001F4C8 Heart Sound Waveform")
-            with gr.Column():
-                spec_plot = gr.Plot(label="\U0001F308 Mel Spectrogram")
-
-        analyze_btn.click(
-            fn=classify_heart_sound,
-            inputs=[audio_input],
-            outputs=[output_result, wave_plot, spec_plot],
-        )
-
-        gr.Markdown("---")
-        with gr.Accordion("How it works", open=False):
-            gr.Markdown(
-                """
-                1. **Preprocessing** — Bandpass filter (20-1000 Hz) + wavelet denoising removes noise
-                2. **Mel Spectrogram** — Audio converted to 128-band mel spectrogram (128x128 image)
-                3. **CNN Classification** — EfficientNet-B0 analyzes the spectrogram
-                4. **Multi-segment Voting** — Longer recordings are split into overlapping segments and averaged
-                """,
-                elem_classes=["how-it-works"],
-            )
-
-        gr.Markdown(
-            "\u26A0\uFE0F *This is a research tool, not a medical device. Always consult a cardiologist.*",
-            elem_classes=["disclaimer"],
-        )
-
-    return app
-
-
-def run_app(share: bool = False, server_port: int = 7860):
-    """Launch the Gradio app.
-
-    Args:
-        share: If True, creates a public Gradio link.
-        server_port: Local port number.
-    """
-    app = create_app()
-    app.launch(
-        share=share,
-        server_name="0.0.0.0",
-        server_port=server_port,
-        css=APP_CSS,
+    st.markdown(
+        "<div class='disclaimer'>Research prototype only. This is not a medical device and must not be used as a clinical diagnosis.</div>",
+        unsafe_allow_html=True,
     )
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    run_app(share=True)
+    render_streamlit_app()

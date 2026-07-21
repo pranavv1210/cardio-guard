@@ -1,28 +1,22 @@
 """
-Tests for Phase 6 — Gradio App
+Tests for Phase 6 - Streamlit app and inference wrapper.
 """
-import tempfile
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 import soundfile as sf
 import torch
 
-from src.config import SAMPLE_RATE, SEGMENT_SAMPLES, LABEL_NAMES
-from app import classify_heart_sound, create_app
+from app import classify_heart_sound, predict_heart_sound, render_streamlit_app
+from src.config import SAMPLE_RATE
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fixtures
-# ──────────────────────────────────────────────────────────────────────────────
 @pytest.fixture
 def fake_wav(tmp_path):
-    """Create a fake 5-second heart sound .wav file."""
     duration = 5.0
     t = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
-    # Simulate heart-like signal: low freq oscillation
     audio = (
         0.5 * np.sin(2 * np.pi * 40 * t)
         + 0.3 * np.sin(2 * np.pi * 80 * t)
@@ -36,7 +30,6 @@ def fake_wav(tmp_path):
 
 @pytest.fixture
 def short_wav(tmp_path):
-    """Create a too-short .wav file (0.5 seconds)."""
     audio = np.random.randn(int(SAMPLE_RATE * 0.5)).astype(np.float32)
     wav_path = tmp_path / "short.wav"
     sf.write(str(wav_path), audio, SAMPLE_RATE)
@@ -45,7 +38,6 @@ def short_wav(tmp_path):
 
 @pytest.fixture
 def mock_model():
-    """Mock the get_model function to avoid loading real weights."""
     from src.phase4_train import build_model, get_transforms
 
     model = build_model(pretrained=False)
@@ -57,51 +49,81 @@ def mock_model():
         yield
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# classify_heart_sound
-# ──────────────────────────────────────────────────────────────────────────────
+class TestPredictHeartSound:
+    def test_returns_prediction_result(self, fake_wav, mock_model):
+        result = predict_heart_sound(fake_wav)
+        assert result.label in {"NORMAL", "ABNORMAL", "UNCERTAIN"}
+        assert 0.0 <= result.normal_probability <= 1.0
+        assert 0.0 <= result.abnormal_probability <= 1.0
+        assert 0.0 <= result.confidence <= 1.0
+        assert isinstance(result.waveform_figure, plt.Figure)
+        assert isinstance(result.spectrogram_figure, plt.Figure)
+        plt.close(result.waveform_figure)
+        plt.close(result.spectrogram_figure)
+
+    def test_low_abnormal_probability_is_normal(self, fake_wav):
+        with (
+            patch("app._predict_probabilities", return_value=(np.array([0.91, 0.09]), np.zeros((128, 128)))),
+            patch("app.load_optimal_threshold", return_value=0.74),
+        ):
+            result = predict_heart_sound(fake_wav)
+
+        assert result.label == "NORMAL"
+        assert result.normal_probability == pytest.approx(0.91)
+        assert result.abnormal_probability == pytest.approx(0.09)
+
+    def test_high_abnormal_probability_is_abnormal(self, fake_wav):
+        with (
+            patch("app._predict_probabilities", return_value=(np.array([0.08, 0.92]), np.zeros((128, 128)))),
+            patch("app.load_optimal_threshold", return_value=0.74),
+        ):
+            result = predict_heart_sound(fake_wav)
+
+        assert result.label == "ABNORMAL"
+        assert result.normal_probability == pytest.approx(0.08)
+        assert result.abnormal_probability == pytest.approx(0.92)
+
+    def test_low_confidence_prediction_is_uncertain(self, fake_wav):
+        with (
+            patch("app._predict_probabilities", return_value=(np.array([0.52, 0.48]), np.zeros((128, 128)))),
+            patch("app.load_optimal_threshold", return_value=0.74),
+        ):
+            result = predict_heart_sound(fake_wav)
+
+        assert result.label == "UNCERTAIN"
+
+    def test_none_input_raises_clear_error(self):
+        with pytest.raises(ValueError, match="upload or record"):
+            predict_heart_sound(None)
+
+    def test_short_audio_raises_clear_error(self, short_wav):
+        with pytest.raises(ValueError, match="too short"):
+            predict_heart_sound(short_wav)
+
+
 class TestClassifyHeartSound:
-    def test_returns_tuple_with_text_and_plot(self, fake_wav, mock_model):
+    def test_returns_tuple_with_text_and_plots(self, fake_wav, mock_model):
         result_text, wave_fig, spec_fig = classify_heart_sound(fake_wav)
-        assert isinstance(result_text, str)
-        assert "NORMAL" in result_text or "ABNORMAL" in result_text
+        assert any(label in result_text for label in ("NORMAL", "ABNORMAL", "UNCERTAIN"))
+        assert "%" in result_text
         assert wave_fig is not None
         assert spec_fig is not None
-
-    def test_spectrogram_is_matplotlib_figure(self, fake_wav, mock_model):
-        import matplotlib.pyplot as plt
-        _, wave_fig, spec_fig = classify_heart_sound(fake_wav)
-        assert isinstance(spec_fig, plt.Figure)
-        assert isinstance(wave_fig, plt.Figure)
-        plt.close(spec_fig)
         plt.close(wave_fig)
+        plt.close(spec_fig)
 
-    def test_confidence_shown_in_result(self, fake_wav, mock_model):
-        result_text, _, _ = classify_heart_sound(fake_wav)
-        assert "%" in result_text
-
-    def test_none_input_returns_message(self, mock_model):
+    def test_none_input_returns_error_tuple(self):
         result_text, wave_fig, spec_fig = classify_heart_sound(None)
-        assert "upload" in result_text.lower() or "please" in result_text.lower()
+        assert "upload" in result_text.lower() or "record" in result_text.lower()
         assert wave_fig is None
         assert spec_fig is None
 
-    def test_short_audio_returns_error(self, short_wav, mock_model):
+    def test_short_audio_returns_error_tuple(self, short_wav):
         result_text, wave_fig, spec_fig = classify_heart_sound(short_wav)
         assert "short" in result_text.lower() or "error" in result_text.lower()
         assert wave_fig is None
         assert spec_fig is None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# create_app
-# ──────────────────────────────────────────────────────────────────────────────
-class TestCreateApp:
-    def test_app_creates_without_error(self):
-        app = create_app()
-        assert app is not None
-
-    def test_app_is_gradio_blocks(self):
-        import gradio as gr
-        app = create_app()
-        assert isinstance(app, gr.Blocks)
+class TestStreamlitApp:
+    def test_render_function_exists(self):
+        assert callable(render_streamlit_app)
