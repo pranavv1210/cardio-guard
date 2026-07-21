@@ -52,7 +52,7 @@ def mock_model():
 class TestPredictHeartSound:
     def test_returns_prediction_result(self, fake_wav, mock_model):
         result = predict_heart_sound(fake_wav)
-        assert result.label in {"NORMAL", "ABNORMAL", "UNCERTAIN"}
+        assert result.label in {"NORMAL", "ABNORMAL"}
         assert 0.0 <= result.normal_probability <= 1.0
         assert 0.0 <= result.abnormal_probability <= 1.0
         assert 0.0 <= result.confidence <= 1.0
@@ -83,14 +83,14 @@ class TestPredictHeartSound:
         assert result.normal_probability == pytest.approx(0.08)
         assert result.abnormal_probability == pytest.approx(0.92)
 
-    def test_low_confidence_prediction_is_uncertain(self, fake_wav):
+    def test_low_confidence_prediction_still_returns_binary_label(self, fake_wav):
         with (
             patch("app._predict_probabilities", return_value=(np.array([0.52, 0.48]), np.zeros((128, 128)))),
             patch("app.load_optimal_threshold", return_value=0.74),
         ):
             result = predict_heart_sound(fake_wav)
 
-        assert result.label == "UNCERTAIN"
+        assert result.label == "NORMAL"
 
     def test_none_input_raises_clear_error(self):
         with pytest.raises(ValueError, match="upload or record"):
@@ -104,7 +104,7 @@ class TestPredictHeartSound:
 class TestClassifyHeartSound:
     def test_returns_tuple_with_text_and_plots(self, fake_wav, mock_model):
         result_text, wave_fig, spec_fig = classify_heart_sound(fake_wav)
-        assert any(label in result_text for label in ("NORMAL", "ABNORMAL", "UNCERTAIN"))
+        assert "NORMAL" in result_text or "ABNORMAL" in result_text
         assert "%" in result_text
         assert wave_fig is not None
         assert spec_fig is not None

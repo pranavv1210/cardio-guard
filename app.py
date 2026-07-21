@@ -41,7 +41,6 @@ _device = None
 _transform = None
 
 _NATIVE_EXTS = {".wav", ".flac", ".ogg", ".mp3"}
-MIN_BINARY_CONFIDENCE = 0.60
 
 
 @dataclass(frozen=True)
@@ -218,9 +217,8 @@ def predict_heart_sound(audio_filepath: str | None) -> PredictionResult:
     abnormal_probability = float(probs[1])
     normal_probability = float(probs[0])
 
-    binary_label = "ABNORMAL" if abnormal_probability >= threshold else "NORMAL"
-    confidence = abnormal_probability if binary_label == "ABNORMAL" else normal_probability
-    label = binary_label if confidence >= MIN_BINARY_CONFIDENCE else "UNCERTAIN"
+    label = "ABNORMAL" if abnormal_probability >= threshold else "NORMAL"
+    confidence = abnormal_probability if label == "ABNORMAL" else normal_probability
     status_text = (
         f"{label} | confidence {confidence * 100:.1f}% | "
         f"normal {normal_probability * 100:.1f}% | "
@@ -247,7 +245,7 @@ def classify_heart_sound(audio_filepath: str | None) -> tuple[str, plt.Figure | 
     except ValueError as exc:
         return f"Error: {exc}", None, None
 
-    icon = "!" if result.label == "ABNORMAL" else "OK" if result.label == "NORMAL" else "?"
+    icon = "!" if result.label == "ABNORMAL" else "OK"
     text = (
         f"## {icon} {result.label}\n"
         f"Confidence: **{result.confidence * 100:.1f}%**\n\n"
@@ -296,6 +294,7 @@ def render_streamlit_app() -> None:
             padding: 1rem;
             margin: 1rem 0;
             background: #ffffff;
+            color: #101828;
             box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
         }
         .result-normal {
@@ -304,13 +303,11 @@ def render_streamlit_app() -> None:
         .result-abnormal {
             border-left: 6px solid #d83b3b;
         }
-        .result-uncertain {
-            border-left: 6px solid #b7791f;
-        }
         .result-label {
             font-size: 1.55rem;
             font-weight: 800;
             margin-bottom: 0.35rem;
+            color: #101828;
         }
         .metric-row {
             display: grid;
@@ -323,6 +320,7 @@ def render_streamlit_app() -> None:
             border-radius: 8px;
             padding: 0.75rem;
             background: #fafafa;
+            color: #101828;
         }
         .metric-box span {
             display: block;
@@ -333,6 +331,7 @@ def render_streamlit_app() -> None:
             display: block;
             font-size: 1.2rem;
             margin-top: 0.15rem;
+            color: #101828;
         }
         .disclaimer {
             color: #667085;
@@ -392,12 +391,7 @@ def render_streamlit_app() -> None:
                 st.error(str(exc))
                 return
 
-        if result.label == "ABNORMAL":
-            result_class = "result-abnormal"
-        elif result.label == "NORMAL":
-            result_class = "result-normal"
-        else:
-            result_class = "result-uncertain"
+        result_class = "result-abnormal" if result.label == "ABNORMAL" else "result-normal"
         st.markdown(
             f"""
             <div class="result-card {result_class}">
